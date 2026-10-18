@@ -1,0 +1,7 @@
+# build.sh working tree
+/downloads/
+/build/
+/out/
+*.tar
+linux-*.tar.xz
+*.part
