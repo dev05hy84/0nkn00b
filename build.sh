@@ -12,7 +12,10 @@
 #   build/kernel-<ver>/arch/arm64/boot/Image.gz   - kernel image
 #   build/kernel-<ver>/.../midgard/mali_kbase.ko  - Kbase module
 #   build/images/virt_mali.dtb                    - qemu-virt DTB + Mali node
-#   out/  (copies of the three artifacts above)
+#   out/Image.gz                                  - collected kernel image
+#   out/mali_kbase.ko                             - collected Kbase module
+#   out/virt_mali.dtb                             - collected DTB
+#   out/initramfs-arm64.cpio.gz                   - boot initramfs (busybox + module)
 #
 # Overridable environment variables:
 #   KERNEL_VERSION     (default 5.10.155)
@@ -25,6 +28,8 @@
 #   ENABLE_DEBUG_INFO  0 | 1             (default 0; README used 1)
 #   AUTO_INSTALL       0 | 1             (default 1: apt-get missing packages)
 #   JOBS               (default: nproc)
+#   FORCE_BUILD        0 | 1             (default 0: skip build if out/ artifacts exist)
+#   BUILD_INITRAMFS    0 | 1             (default 1: build the boot initramfs)
 #
 set -euo pipefail
 
@@ -38,6 +43,8 @@ ENABLE_KASAN="${ENABLE_KASAN:-0}"
 ENABLE_DEBUG_INFO="${ENABLE_DEBUG_INFO:-0}"
 AUTO_INSTALL="${AUTO_INSTALL:-1}"
 JOBS="${JOBS:-$(nproc)}"
+FORCE_BUILD="${FORCE_BUILD:-0}"
+BUILD_INITRAMFS="${BUILD_INITRAMFS:-1}"
 
 # Make sure every (sub-)make invocation picks the cross toolchain.
 export ARCH CROSS_COMPILE
@@ -64,7 +71,7 @@ case "$MALI_MODE" in jm|csf) ;; *) fail "MALI_MODE must be jm|csf (got $MALI_MOD
 case "$DRIVER_MODE" in module|builtin) ;; *) fail "DRIVER_MODE must be module|builtin (got $DRIVER_MODE)";; esac
 
 # ---------------------------------------------------------------------------
-# [0/7] prerequisite check (install missing packages)
+# [0/9] prerequisite check (install missing packages)
 # ---------------------------------------------------------------------------
 # package:probe-command   (empty probe => verify with dpkg -s)
 DEPS=(
@@ -86,7 +93,7 @@ DEPS=(
 )
 have() { [ -n "$2" ] && command -v "$2" >/dev/null 2>&1 || dpkg -s "$1" >/dev/null 2>&1; }
 
-log "[0/7] checking prerequisites"
+log "[0/9] checking prerequisites"
 missing=()
 for d in "${DEPS[@]}"; do
   pkg="${d%%:*}"; cmd="${d#*:}"
@@ -104,9 +111,9 @@ else
 fi
 
 # ---------------------------------------------------------------------------
-# [1/7] create the working structure
+# [1/9] create the working structure
 # ---------------------------------------------------------------------------
-log "[1/7] creating directory structure"
+log "[1/9] creating directory structure"
 mkdir -p "$DL" "$KDIR" "$MDIR" "$IMG" "$LOGDIR" "$OUT"
 if [ ! -f "$ROOT/.gitignore" ]; then
   cat > "$ROOT/.gitignore" <<'EOF'
@@ -123,7 +130,22 @@ printf '  %s\n' "downloads/  build/kernel-${KERNEL_VERSION}/  build/mali-${DRIVE
                 "build/images/  build/logs/  out/"
 
 # ---------------------------------------------------------------------------
-# [1/7] fetch sources
+# decide whether the kernel/driver build can be skipped
+# ---------------------------------------------------------------------------
+# If a previous run already produced the kernel image and the Kbase module in
+# out/, reuse them and jump straight to the DTB / initramfs / launch steps.
+# Force a full rebuild with FORCE_BUILD=1.
+if [ "$FORCE_BUILD" != 1 ] && [ -s "$OUT/Image.gz" ] && [ -s "$OUT/mali_kbase.ko" ]; then
+  SKIP_BUILD=1
+  log "existing kernel + driver found in $OUT/ -> skipping build steps (FORCE_BUILD=1 to rebuild)"
+else
+  SKIP_BUILD=0
+fi
+
+if [ "$SKIP_BUILD" = 0 ]; then
+
+# ---------------------------------------------------------------------------
+# fetch helpers
 # ---------------------------------------------------------------------------
 # adopt a tarball already present in the repo root (e.g. a manual download)
 adopt() { # <basename>
@@ -140,35 +162,51 @@ fetch() { # <url> <dest>
   mv "$dest.part" "$dest"
 }
 
-log "[2/7] fetching sources (kernel $KERNEL_VERSION, driver $DRIVER_VERSION)"
+# ---------------------------------------------------------------------------
+# [2/9] fetch sources
+# ---------------------------------------------------------------------------
+log "[2/9] fetching sources (kernel $KERNEL_VERSION, driver $DRIVER_VERSION)"
 adopt "$KERNEL_TARBALL"
 adopt "$DRIVER_TARBALL"
 fetch "$KERNEL_URL" "$DL/$KERNEL_TARBALL"
 fetch "$DRIVER_URL" "$DL/$DRIVER_TARBALL"
 
-log "[3/7] extracting"
+# ---------------------------------------------------------------------------
+# [3/9] extract
+# ---------------------------------------------------------------------------
+log "[3/9] extracting"
 if [ ! -f "$KDIR/Makefile" ]; then
   tar -C "$KDIR" --strip-components=1 -xJf "$DL/$KERNEL_TARBALL"
 fi
 # Bifrost tarball has no wrapper dir: entries start at driver/product/...
 rm -rf "$MDIR"; mkdir -p "$MDIR"
 tar -C "$MDIR" -xf "$DL/$DRIVER_TARBALL"
-DRV="$MDIR/driver/product/kernel"
-[ -d "$DRV/drivers/gpu/arm/midgard" ] || fail "unexpected driver layout under $MDIR"
+MDIR_SRC="$MDIR/driver/product/kernel"
+[ -d "$MDIR_SRC" ] || fail "driver tree not found under $MDIR"
 
-log "[4/7] integrating Kbase into the kernel tree"
-cp -a "$DRV/." "$KDIR/"
-# drivers/gpu/Makefile (idempotent)
-grep -q 'obj-\$(CONFIG_MALI_MIDGARD) += arm/' "$KDIR/drivers/gpu/Makefile" 2>/dev/null \
-  || echo 'obj-$(CONFIG_MALI_MIDGARD) += arm/' >> "$KDIR/drivers/gpu/Makefile"
-# drivers/video/Kconfig (idempotent; anchor on the drm source line)
+# ---------------------------------------------------------------------------
+# [4/9] integrate Kbase into the kernel tree
+# ---------------------------------------------------------------------------
+log "[4/9] integrating Kbase into the kernel tree"
+cp -a "$MDIR_SRC/drivers/." "$KDIR/drivers/"
+if [ ! -f "$KDIR/drivers/gpu/arm/Kconfig" ]; then
+  mkdir -p "$KDIR/drivers/gpu/arm"
+  cp -a "$MDIR_SRC/drivers/gpu/arm/." "$KDIR/drivers/gpu/arm/"
+fi
+# wire the driver into the build
+if ! grep -q 'gpu/arm' "$KDIR/drivers/gpu/Makefile" 2>/dev/null; then
+  echo 'obj-$(CONFIG_MALI_MIDGARD) += arm/' >> "$KDIR/drivers/gpu/Makefile"
+fi
+if ! grep -q 'source "drivers/gpu/arm/Kconfig"' "$KDIR/drivers/video/Kconfig" 2>/dev/null; then
+  echo 'source "drivers/gpu/arm/Kconfig"' >> "$KDIR/drivers/video/Kconfig"
+fi
 grep -q 'source "drivers/gpu/arm/Kconfig"' "$KDIR/drivers/video/Kconfig" \
-  || sed -i 's|source "drivers/gpu/drm/Kconfig"|source "drivers/gpu/drm/Kconfig"\nsource "drivers/gpu/arm/Kconfig"|' \
-         "$KDIR/drivers/video/Kconfig"
-grep -q 'source "drivers/gpu/arm/Kconfig"' "$KDIR/drivers/video/Kconfig" \
-  || fail "drivers/video/Kconfig not wired"
+  || fail "drivers/video/Kconfig not wired for the Mali arm Kconfig"
 
-log "[5/7] configuring the kernel (arm64 / Device Tree, MALI_MODE=$MALI_MODE, DRIVER_MODE=$DRIVER_MODE)"
+# ---------------------------------------------------------------------------
+# [5/9] configure
+# ---------------------------------------------------------------------------
+log "[5/9] configuring the kernel (arm64 / Device Tree, MALI_MODE=$MALI_MODE)"
 make -C "$KDIR" ARCH="$ARCH" defconfig >/dev/null
 {
   echo
@@ -193,7 +231,10 @@ grep -q "^CONFIG_MALI_MIDGARD=$([ "$DRIVER_MODE" = module ] && echo m || echo y)
 grep -q '^CONFIG_MALI_PLATFORM_NAME="devicetree"' "$KDIR/.config" \
   || fail "CONFIG_MALI_PLATFORM_NAME not devicetree"
 
-log "[5/7] building kernel + modules ($JOBS jobs; this can take a while)"
+# ---------------------------------------------------------------------------
+# [6/9] build
+# ---------------------------------------------------------------------------
+log "[6/9] building kernel + modules ($JOBS jobs; this can take a while)"
 set +e
 make -C "$KDIR" ARCH="$ARCH" -j"$JOBS" 2>&1 | tee "$LOGDIR/kernel-build.log"
 rc=${PIPESTATUS[0]}
@@ -201,59 +242,86 @@ set -e
 [ "$rc" -eq 0 ] || { tail -40 "$LOGDIR/kernel-build.log"; fail "kernel build failed (see $LOGDIR/kernel-build.log)"; }
 [ -f "$KDIR/arch/arm64/boot/Image.gz" ] || fail "Image.gz not built"
 
-log "[6/7] building the Mali device-tree node into a qemu-virt DTB"
-qemu-system-aarch64 -machine virt -machine "dumpdtb=$IMG/virt_base.dtb" >/dev/null 2>&1
-[ -s "$IMG/virt_base.dtb" ] || fail "qemu dumpdtb failed"
-dtc -I dtb -O dts "$IMG/virt_base.dtb" -o "$IMG/virt_base.dts" >/dev/null 2>&1
-python3 - "$IMG/virt_base.dts" "$IMG/virt_mali.dts" <<'PY'
+MKO="$(find "$KDIR/drivers/gpu/arm/midgard" -name 'mali_kbase.ko' 2>/dev/null | head -1 || true)"
+[ -n "$MKO" ] || fail "mali_kbase.ko not built (is CONFIG_MALI_MIDGARD=m?)"
+cp -f "$KDIR/arch/arm64/boot/Image.gz" "$OUT/Image.gz"
+cp -f "$MKO"                           "$OUT/mali_kbase.ko"
+log "collected out/Image.gz and out/mali_kbase.ko"
+
+fi  # SKIP_BUILD
+
+# ---------------------------------------------------------------------------
+# [7/9] build the Mali device-tree blob (only if we don't already have one)
+# ---------------------------------------------------------------------------
+if [ "$FORCE_BUILD" = 1 ] || [ ! -s "$OUT/virt_mali.dtb" ]; then
+  log "[7/9] building the Mali device-tree node into a qemu-virt DTB"
+  qemu-system-aarch64 -machine virt -machine "dumpdtb=$IMG/virt_base.dtb" >/dev/null 2>&1
+  [ -s "$IMG/virt_base.dtb" ] || fail "qemu dumpdtb failed"
+  dtc -I dtb -O dts "$IMG/virt_base.dtb" -o "$IMG/virt_base.dts" >/dev/null 2>&1
+  python3 - "$IMG/virt_base.dts" "$IMG/virt_mali.dts" <<'PY'
 import re, sys
 src, dst = sys.argv[1], sys.argv[2]
 lines = open(src).read().splitlines(True)
 # Guide node. With the "dummy model" the driver only parses it, so the MMIO
-# address just must not collide with RAM (qemu virt RAM starts at 0x40000000).
-node = (
-    "\tgpu@6e000000 {\n"
-    '\t\tcompatible = "arm,mali-midgard";\n'
-    "\t\treg = <0x0 0x6e000000 0x0 0x200000>;\n"
-    "\t\tinterrupts = <0x0 0xa8 0x4>, <0x0 0xa8 0x4>, <0x0 0xa8 0x4>;\n"
-    '\t\tinterrupt-names = "JOB", "MMU", "GPU";\n'
-    "\t};\n"
-)
-out, in_root, done = [], False, False
-for ln in lines:
-    if not in_root:
-        out.append(ln)
-        if re.match(r"^/ \{", ln):
-            in_root = True
-        continue
-    if (not done) and re.match(r"^\t[A-Za-z0-9,_@.-]+.*\{$", ln.rstrip("\n")):
-        out.append(node)
-        done = True
-    out.append(ln)
-if not done:
-    sys.exit("no root child node found to anchor the gpu node")
-open(dst, "w").writelines(out)
+# address just has to be non-overlapping; we place it well above RAM.
+node = '''\t\tgpu@6e000000 {
+\t\t\tcompatible = "arm,mali-midgard";
+\t\t\treg = <0x0 0x6e000000 0x0 0x200000>;
+\t\t\tinterrupts = <0x0 0xa8 0x4>, <0x0 0xa8 0x4>, <0x0 0xa8 0x4>;
+\t\t\tinterrupt-names = "JOB", "MMU", "GPU";
+\t\t\tclock-names = "apb_pclk";
+\t\t\tclocks = <0x8000>;
+\t\t};
+'''
+# find the root node and its closing brace, insert the gpu node as the last child
+text = ''.join(lines)
+start = text.find('{')
+depth = 0
+end = -1
+for i in range(start, len(text)):
+    if text[i] == '{': depth += 1
+    elif text[i] == '}':
+        depth -= 1
+        if depth == 0:
+            end = i
+            break
+if end < 0:
+    sys.exit("could not locate root node")
+out = text[:end] + '\n' + node + text[end:]
+open(dst, 'w').write(out)
 PY
-dtc -I dts -O dtb "$IMG/virt_mali.dts" -o "$IMG/virt_mali.dtb" >/dev/null 2>&1
-[ -s "$IMG/virt_mali.dtb" ] || fail "dtc dts->dtb failed"
+  dtc -I dts -O dtb "$IMG/virt_mali.dts" -o "$OUT/virt_mali.dtb" >/dev/null 2>&1
+  [ -s "$OUT/virt_mali.dtb" ] || fail "dtc dts->dtb failed"
+else
+  log "[7/9] using existing out/virt_mali.dtb"
+fi
 
-log "[7/7] verifying and collecting artifacts"
-KIMG="$KDIR/arch/arm64/boot/Image.gz"
-MKO="$(find "$KDIR/drivers/gpu/arm/midgard" -name 'mali_kbase.ko' | head -1 || true)"
-fdtget -t s "$IMG/virt_mali.dtb" /gpu@6e000000 compatible 2>/dev/null | grep -q 'arm,mali-midgard' \
-  || fail "gpu node missing/invalid in virt_mali.dtb"
-[ -n "$MKO" ] || fail "mali_kbase.ko not built (MALI_MIDGARD=$([ "$DRIVER_MODE" = module ] && echo m || echo y))"
+# ---------------------------------------------------------------------------
+# [8/9] verify artifacts
+# ---------------------------------------------------------------------------
+log "[8/9] verifying artifacts"
+fdtget -t s "$OUT/virt_mali.dtb" /gpu@6e000000 compatible 2>/dev/null | grep -q 'arm,mali-midgard' \
+  || fail "gpu node missing/invalid in $OUT/virt_mali.dtb"
+[ -s "$OUT/Image.gz" ]     || fail "out/Image.gz missing"
+[ -s "$OUT/mali_kbase.ko" ] || fail "out/mali_kbase.ko missing"
 
-mkdir -p "$OUT"
-cp -f "$KIMG" "$OUT/Image.gz"
-cp -f "$MKO"  "$OUT/mali_kbase.ko"
-cp -f "$IMG/virt_mali.dtb" "$OUT/virt_mali.dtb"
 {
-  echo "kernel  : $KIMG ($(stat -c%s "$KIMG") bytes)"
-  echo "module  : $MKO ($(stat -c%s "$MKO") bytes)"
-  echo "dtb     : $IMG/virt_mali.dtb"
-  echo "release : $(sed -n 's/^MALI_RELEASE_NAME ?= //p' "$KDIR/drivers/gpu/arm/midgard/Kbuild" | head -1)"
+  echo "kernel  : $OUT/Image.gz ($(stat -c%s "$OUT/Image.gz") bytes)"
+  echo "module  : $OUT/mali_kbase.ko ($(stat -c%s "$OUT/mali_kbase.ko") bytes)"
+  echo "dtb     : $OUT/virt_mali.dtb ($(stat -c%s "$OUT/virt_mali.dtb") bytes)"
 } | tee "$LOGDIR/summary.txt"
+
+# ---------------------------------------------------------------------------
+# [8/9] build the boot initramfs (from scratch)
+# ---------------------------------------------------------------------------
+if [ "${BUILD_INITRAMFS:-1}" = 1 ]; then
+  log "[9/9] building the boot initramfs"
+  KO="$OUT/mali_kbase.ko" OUT="$OUT/initramfs-arm64.cpio.gz" \
+    ARCH="$ARCH" CROSS_COMPILE="$CROSS_COMPILE" JOBS="$JOBS" \
+    "$ROOT/initramfs_build.sh" || fail "initramfs build failed"
+else
+  log "[9/9] skipping initramfs (BUILD_INITRAMFS=0)"
+fi
 
 cat <<EOF
 
@@ -261,16 +329,18 @@ cat <<EOF
 ==> launch with:
 
 qemu-system-aarch64 \\
-    -S -gdb tcp::12345 \\
     -machine virt \\
     -cpu cortex-a57 \\
     -smp 2 \\
     -m 4096 \\
     -nographic \\
+    -net nic -net user \\
     -kernel $OUT/Image.gz \\
-    -append 'console=ttyAMA0 root=/dev/ram nokaslr debug earlyprintk' \\
-    -initrd initramfs-arm64.cpio.gz \\
-    -dtb $OUT/virt_mali.dtb
+    -initrd $OUT/initramfs-arm64.cpio.gz \\
+    -dtb $OUT/virt_mali.dtb \\
+    -append 'console=ttyAMA0 rdinit=/init acpi=off nokaslr loglevel=7'
 
-# in the guest:  insmod mali_kbase.ko   (expect "Using Dummy Model" in dmesg)
+# add  -S -gdb tcp::12345  before -kernel to attach gdb
+# in the guest (if INITRAMFS_SHELL=1) run:  /load_mod.sh
+#   dummy model: expect "Using Dummy Model" / "Probed as mali0" in dmesg
 EOF
